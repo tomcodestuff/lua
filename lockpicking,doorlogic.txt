@@ -1,0 +1,233 @@
+
+local Audio = require(game:GetService("ReplicatedStorage"):WaitForChild("AudioData"))
+local CollectionService = game:GetService("CollectionService")
+local TweenService = game:GetService("TweenService")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local RELOCK_TIME = 240
+local PICK_TIME = 1.6
+local PUBLIC_BUILDINGS = {
+	["Corner Shop"] = true,
+	["Pub (The Royal Oak)"] = true
+}
+
+local function safeRequire(name)
+	local module = ServerScriptService:WaitForChild(name, 10)
+	if not module then return nil end
+
+	local ok, result = pcall(require, module)
+	if ok then return result end
+	return nil
+end
+
+local Inv = safeRequire("InventoryUtil")
+local Progression = safeRequire("Progression")
+local ActionPose = require(ServerScriptService:WaitForChild("ActionPose"))
+
+local state = {}
+local prompts = {}
+
+local function notify(player, message)
+	if Progression then
+		Progression.notify(player, message)
+	end
+end
+
+local function updatePrompt(door)
+	local prompt = prompts[door]
+	local s = state[door]
+
+	if not prompt or not prompt.Parent or not s then return end
+
+	if s.open then
+		prompt.ActionText = "Close"
+	elseif door:GetAttribute("Locked") then
+		prompt.ActionText = "Locked"
+	else
+		prompt.ActionText = "Open"
+	end
+end
+
+local function setOpen(door, wantOpen)
+	local s = state[door]
+	if not s then
+		s = {open = false, angle = 0}
+		state[door] = s
+	end
+
+	local leaf = door.PrimaryPart
+	if s.busy or not leaf or s.open == wantOpen then return end
+
+	s.busy = true
+
+	pcall(function()
+		Audio.play3D(wantOpen and "DoorOpen" or "DoorClose", leaf, nil, 60)
+
+		if wantOpen and door:GetAttribute("CanLock") == false then
+			Audio.play3D("ShopBell", leaf, nil, 40)
+		end
+	end)
+
+	local side = door:GetAttribute("HingeSide") or 1
+	local closed = s.open and s.closed or leaf.CFrame
+	s.closed = closed
+
+	local hinge = closed * CFrame.new(side * leaf.Size.X / 2, 0, 0)
+
+	local target = 0
+	if wantOpen then
+		target = 90 * side
+		s.angle = target
+	end
+
+	local alpha = Instance.new("NumberValue")
+	alpha.Value = s.open and s.angle or 0
+
+	alpha.Changed:Connect(function(value)
+		if door.Parent then
+			door:PivotTo(hinge * CFrame.Angles(0, math.rad(value), 0) * hinge:Inverse() * closed)
+		end
+	end)
+
+	local tween = TweenService:Create(
+		alpha,
+		TweenInfo.new(0.45, Enum.EasingStyle.Sine),
+		{Value = target}
+	)
+
+	tween:Play()
+	tween.Completed:Wait()
+	alpha:Destroy()
+
+	s.open = wantOpen
+	s.busy = false
+
+	if not wantOpen then
+		local mark = os.clock()
+		s.closedAt = mark
+
+		task.delay(RELOCK_TIME, function()
+			if door.Parent and not s.open and s.closedAt == mark and door:GetAttribute("CanLock") then
+				door:SetAttribute("Locked", true)
+			end
+		end)
+	end
+
+	updatePrompt(door)
+end
+
+local function pickLock(door, player)
+	local s = state[door]
+	if s.picking then return end
+
+	if not player:GetAttribute("Stat_CanLockpick") then
+		notify(player, "It's locked. A Lockpicker could get in (IQ perk)")
+		return
+	end
+
+	local pinsNeeded = 1 + ((door.Parent and door.Parent:GetAttribute("LockLevel")) or 0)
+
+	if not Inv or Inv.getCount(player, "Bobby Pin") < pinsNeeded then
+		notify(player, pinsNeeded > 1 and ("This lock is a good one. You need " .. pinsNeeded .. " Bobby Pins") or "It's locked. You need a Bobby Pin")
+		return
+	end
+
+	s.picking = true
+	notify(player, "Picking the lock...")
+
+	ActionPose.play(player, "Lockpick", PICK_TIME)
+	task.wait(PICK_TIME)
+
+	local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+	local leaf = door.PrimaryPart
+
+	if not root or not leaf or (root.Position - leaf.Position).Magnitude > 11 then
+		s.picking = false
+		notify(player, "You moved away from the lock")
+		return
+	end
+
+	if Inv.remove(player, "Bobby Pin", pinsNeeded) then
+		door:SetAttribute("Locked", false)
+		notify(player, "Click. The Bobby Pin is used up")
+
+		if Progression then
+			Progression.award(player, "Lockpick")
+		end
+
+		updatePrompt(door)
+		s.picking = false
+		setOpen(door, true)
+	else
+		s.picking = false
+	end
+end
+
+local function setup(door)
+	local leaf = door.PrimaryPart
+	if not door:IsA("Model") or not leaf or leaf:FindFirstChild("DoorPrompt") then return end
+
+	local house = door.Parent
+	local isFront = false
+
+	if house and house:IsA("Model") then
+		isFront = house:GetPivot():PointToObjectSpace(leaf.Position).Z < 0
+	end
+
+	local public = isFront and house and (
+		PUBLIC_BUILDINGS[house.Name] == true or house:GetAttribute("ShopKind") ~= nil
+	)
+
+	door:SetAttribute("CanLock", not public)
+	door:SetAttribute("Locked", not public)
+
+	state[door] = state[door] or {open = false, angle = 0}
+
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.Name = "DoorPrompt"
+	prompt.ObjectText = "Door"
+	prompt.KeyboardKeyCode = Enum.KeyCode.E
+	prompt.HoldDuration = 0
+	prompt.MaxActivationDistance = 8
+	prompt.RequiresLineOfSight = false
+	prompt.Parent = leaf
+
+	prompts[door] = prompt
+	updatePrompt(door)
+
+	prompt.Triggered:Connect(function(player)
+		local s = state[door]
+
+		if s.open then
+			setOpen(door, false)
+		elseif door:GetAttribute("Locked") and not (door.Parent and door.Parent:GetAttribute("HideoutOwner") == player.UserId) then
+			pickLock(door, player)
+		else
+			setOpen(door, true)
+		end
+	end)
+
+	door:GetAttributeChangedSignal("Locked"):Connect(function()
+		updatePrompt(door)
+	end)
+
+	door.Destroying:Connect(function()
+		state[door] = nil
+		prompts[door] = nil
+	end)
+end
+
+local control = Instance.new("BindableEvent")
+control.Name = "DoorControl"
+control.Parent = ServerScriptService
+
+control.Event:Connect(function(door, action)
+	if typeof(door) ~= "Instance" or not door.Parent or not state[door] then return end
+	task.spawn(setOpen, door, action == "open")
+end)
+
+for _, door in ipairs(CollectionService:GetTagged("HouseDoor")) do
+	setup(door)
+end
+
+CollectionService:GetInstanceAddedSignal("HouseDoor"):Connect(setup)
