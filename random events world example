@@ -1,851 +1,909 @@
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
-local ServerStorage = game:GetService("ServerStorage")
-local CollectionService = game:GetService("CollectionService")
-local TweenService = game:GetService("TweenService")
+--connected Discord-GitHub
+--Disc: whatifididthis  Roblox: epicMr_fudge (group owner of Recreation studio- solo dev)
 
-local function optional(parent, name)
-	local module = parent:FindFirstChild(name) or parent:WaitForChild(name, 8)
+-- The people who live in the houses. They are spawned when a player comes near a furnished house, go about their day
+-- (watch TV, eat, cook, use the toilet, sleep in their bed, chat with each other, step outside) and despawn when nobody
+-- is near. Their fighting is the ordinary "Regular" brain (see the Resident template); this module is their daily life:
+--   * Life.start(npc, provoke) runs their routine and watches for strangers in their home (then they shout and attack)
+--   * Life.wake(npc) gets one out of bed / off the sofa / off the toilet at once
+
+-- ===== services =====
+local Players: Players = game:GetService("Players")
+local PathfindingService: PathfindingService = game:GetService("PathfindingService") -- navmesh agent paths (ComputeAsync)
+local CollectionService: CollectionService = game:GetService("CollectionService")     -- tags ("Posed", "HouseDoor", "Bartender")
+local ServerScriptService: ServerScriptService = game:GetService("ServerScriptService")
+local ServerStorage: ServerStorage = game:GetService("ServerStorage")                 -- NPCTemplates live here (never replicated)
+local HttpService: HttpService = game:GetService("HttpService")                       -- only used for JSONDecode
+
+-- ===== types =====
+-- Roles and activities are string literal unions so a typo ("sleeping") is a type error instead of a silent bug.
+type ResidentRole = "landlord" | "guest" | "bartender"
+type Activity = "tv" | "eat" | "toilet" | "pub" | "sleep" | "cook" | "wander" | "chat" | "bartend" | "outside"
+type PoseName = "Sit" | "Lie"
+
+-- one room of a home, in WORLD space (decoded from the house's RoomsJson attribute by roomsOf)
+type Room = {
+	type: string,
+	floor: number,    -- 0 = ground, 1 = upstairs
+	centre: Vector3,  -- world-space centre of the room floor
+	w: number,        -- width along house X, already multiplied by HouseScale
+	d: number,        -- depth along house Z, already multiplied by HouseScale
+}
+
+-- the raw JSON shape stored in the "RoomsJson" attribute (house-local coordinates)
+type RoomJson = {type: string, floor: number, x0: number, x1: number, y: number, z0: number, z1: number}
+type RoomsPayload = {rooms: {RoomJson}}
+
+-- furniture grouped by prop name ("Sofa", "Single Bed" ...)
+type PropMap = {[string]: {Model}}
+
+-- per-resident runtime state, keyed by NPC model in `residents`
+type ResidentState = {
+	house: Model,
+	unit: number,                      -- which home of a terrace (a house can contain several "Units")
+	role: ResidentRole,
+	props: PropMap,
+	rooms: {Room},
+	upstairs: boolean?,                -- true for the pub-lounge staff
+	zone: BasePart?,                   -- the PowerZone part covering this home's rooms
+	seen: {[Player]: number},          -- seconds-ish of line of sight per player (notice timer)
+	roomCentreOf: ((pos: Vector3) -> Vector3?)?,
+	activity: Activity?,
+	floorOnly: number?,                -- restricts firstOf() to props on that floor
+	chatting: boolean?,
+	reactedToDark: boolean?,
+	gone: boolean?,                    -- set when the NPC is destroyed; every loop checks it
+	-- seat/bed state:
+	placed: boolean?,                  -- HumanoidRootPart is anchored on a seat/bed
+	posed: boolean?,                   -- "Pose" attribute + "Posed" tag are applied
+	exit: CFrame?,                     -- where to put him when he gets up
+}
+
+type Activity_fn = (npc: Model, S: ResidentState) -> boolean
+type WeightedActivity = {number | Activity_fn}  -- {weight, fn}; kept as a loose array to mirror the original
+
+-- Soft dependencies (loaded with safeRequire so a missing module never breaks the residents)
+type SpeechModule = { say: (npc: Model, text: string) -> () }
+type AlertModule = {
+	canSee: (observer: Model, target: Model, range: number) -> boolean, -- line-of-sight style check
+	crime: (player: Player, heat: number, position: Vector3) -> (),     -- raises police heat at a position
+}
+type OccupancyModule = {
+	add: (prop: Instance, npc: Model, onEvicted: (npc: Model) -> ()) -> (),
+	remove: (npc: Model) -> (),
+	occupantsOf: (prop: Instance) -> {Model},
+}
+
+type LifeModule = {
+	residents: {[Model]: ResidentState},
+	release: (npc: Model, keepPlace: boolean?) -> (),
+	wake: (npc: Model) -> (),
+	start: (npc: Model, provoke: (char: Model) -> ()) -> (),
+	spawn: (house: Model, unit: number, role: ResidentRole, upstairs: boolean?) -> Model?,
+	manager: () -> (),
+}
+
+-- require() can throw, so it is wrapped in pcall. Return type is `any` because the module shape is only known by contract.
+local function safeRequire(name: string): any
+	local module = ServerScriptService:WaitForChild(name, 10) -- yields up to 10s, returns nil on timeout
 	if not module then return nil end
-	local ok, result = pcall(require, module)
-	if not ok then warn("[RandomEvents] " .. name .. " failed: " .. tostring(result)) return nil end
-	return result
+	local ok, result = pcall(require, module :: ModuleScript)
+	return ok and result or nil
+end
+local Speech = safeRequire("Speech") :: SpeechModule?
+local Alert = safeRequire("CombatAlert") :: AlertModule?
+local Occupancy = safeRequire("Occupancy") :: OccupancyModule?
+
+local Life = {} :: LifeModule -- cast the empty table; the fields are filled in below
+
+-- ===== tuning (studs) =====
+local MAX_RESIDENTS: number = 18
+local SPAWN_RANGE: number = 130    -- spawn homes whose pivot is closer than this to a player
+local DESPAWN_RANGE: number = 300  -- despawn beyond this (gap > spawn range = hysteresis, no flicker)
+local SIT_LIFT: number, LIE_LIFT: number = 0.95, 0.55 -- HumanoidRootPart height above seat top / mattress top
+
+local residents: {[Model]: ResidentState} = {} -- [npc] = state
+local folder: Folder?
+
+-- ===== what they say =====
+local PAIRS: {{string}} = {
+	{"How was your day?", "Same as ever. Boss was on my back all shift."},
+	{"Did you sort the heating?", "Not yet. The landlord's ignoring my calls again."},
+	{"What's for tea?", "Beans on toast. Don't look at me like that."},
+	{"Have you seen the price of milk?", "Don't. I'm still recovering."},
+	{"Did you hear next door last night?", "Every word. Walls like paper."},
+	{"Rain again tomorrow, apparently.", "Course it is. Perfect."},
+	{"Fancy a brew?", "Go on then. Two sugars."},
+	{"Did you lock up properly?", "Yes! Stop asking me that."},
+	{"Anything good on the telly?", "Same rubbish on repeat."},
+	{"My back's killing me.", "That's what you get for lifting that wardrobe."},
+	{"Did you pay the electric?", "...Tuesday. I'll do it Tuesday."},
+	{"The bins go out tomorrow.", "I'll do it. I always do it."},
+	{"Saw someone kipping on a bench again.", "Poor sod. Cold night for it."},
+	{"Reckon the neighbours are up to something?", "They're always up to something."},
+	{"Did you get any sleep?", "Not a wink. The traffic was mental."},
+	{"I'm thinking of painting the hall.", "You said that last year."},
+	{"Did you see that fire engine go past?", "Third time this week. Something's going on."},
+	{"Be careful out there. Lots of strange people about.", "When aren't there?"},
+}
+local SOLO: {string} = {"Where did I put my keys...", "Need to hoover this place.", "Cold in here.", "Could murder a cuppa.", "Bills, bills, bills.",
+	"Must ring my mum back.", "Was that the post?", "Right. What was I doing?", "Chilly tonight.", "Is that damp? That's damp."}
+local TV: {string} = {"Rubbish on tonight.", "Not this again.", "Oh, come ON!", "Ha! Brilliant.", "Who writes this stuff?", "Isn't this the same one as last week?"}
+local COOK: {string} = {"Smells decent.", "Don't burn it. Don't burn it.", "Needs more salt.", "Almost done."}
+local EAT: {string} = {"Not bad.", "Could do with ketchup.", "Hot! Hot!", "Mmm."}
+local SLEEP: {string} = {"Zzz...", "Mmm... five more minutes...", "*snore*"}
+local PUB: {string} = {"Another pint, Dave!", "Quiet in here tonight.", "Cheers, mate.", "Did you see the match?", "Same again."}
+local TRESPASS: {string} = {"Oi! Who the hell are you?!", "Get out of my house!", "BURGLAR! Get out!", "What are you doing in here?!",
+	"You've got some nerve breaking in!", "I'm calling the police!"}
+local BARTENDER: {string} = {"What'll it be?", "Mind the floor, it's sticky.", "Last orders. In about six hours.", "Try the Chunder. It's dangerous.",
+	"Don't touch the jukebox.", "Another Froth Mount, love?", "No tab. Ever.", "Don't be a stranger."}
+local POWER: {string} = {"Oh, you're joking. Power's gone.", "Great. The lights are out.", "Not again... the fuse box!", "Who turned the lights off?!"}
+
+-- Generic helper: the type parameter T keeps the element type, so pick(TV) is a string and pick(PAIRS) is {string}.
+local function pick<T>(list: {T}): T return list[math.random(#list)] end -- math.random(n) is inclusive 1..n
+
+local function say(npc: Model, text: string)
+	if Speech and npc.Parent then Speech.say(npc, text) end
 end
 
-local Sidewalk = optional(ServerScriptService, "Sidewalk")
-local Visibility = optional(ServerScriptService, "Visibility")
-local Speech = optional(ServerScriptService, "Speech")
-local Alert = optional(ServerScriptService, "CombatAlert")
-local Heat = optional(ServerScriptService, "Heat")
-local Progression = optional(ServerScriptService, "Progression")
-local Destructibles = optional(ServerScriptService, "Destructibles")
-local RagdollUtil = optional(ServerScriptService, "RagdollUtil")
-local Vehicles = optional(ServerScriptService, "Vehicles")
-local RoadNetwork = optional(ServerScriptService, "RoadNetwork")
-local Audio = optional(ReplicatedStorage, "AudioData")
-local FightSounds = optional(ReplicatedStorage, "FightSounds")
+-- Distance on the XZ plane only. Vector3 * Vector3 multiplies component-wise, so (1,0,1) zeroes the height difference.
+local function flat(a: Vector3, b: Vector3): number
+	return ((a - b) * Vector3.new(1, 0, 1)).Magnitude
+end
 
-local npcFolder = workspace:WaitForChild("NPCs", 30)
-local templates = ServerStorage:WaitForChild("NPCTemplates")
-if not npcFolder or not Sidewalk then warn("[RandomEvents] NPC folder or Sidewalk module missing: events are off") return end
-if RoadNetwork and RoadNetwork.count and RoadNetwork.count() < 2 then RoadNetwork = nil end
+local function alive(npc: Model): boolean
+	local hum = npc.Parent and npc:FindFirstChildOfClass("Humanoid") -- nil if the NPC was destroyed/unparented
+	return hum ~= nil and hum.Health > 0
+end
 
-local PARTY_SOUND = (Audio and Audio.IDS and Audio.IDS.Party) or 9112759922
-local FIRST_EVENT_DELAY = 50
-local MIN_GAP, MAX_GAP = 80, 160
-local MAX_ACTIVE = 3
+-- fighting, grabbed, carried or ragdolled: the routine stands aside
+-- Attributes are replicated, Variant-typed values; they are truthy-checked here, so the return is loosely typed.
+local function busy(npc: Model): any
+	return npc:GetAttribute("Aggro") or npc:GetAttribute("Held") or npc:GetAttribute("Carried") or npc:GetAttribute("Ragdolled")
+end
 
-local function pick(list) return list[math.random(#list)] end
-local function flat(v) return Vector3.new(v.X, 0, v.Z) end
+local function aborted(npc: Model): boolean
+	local S = residents[npc]
+	return not S or S.gone == true or not alive(npc) or busy(npc) ~= nil and busy(npc) ~= false
+end
 
-local function rootOf(player)
-	local char = player.Character
-	local hum = char and char:FindFirstChildOfClass("Humanoid")
-	local root = char and char:FindFirstChild("HumanoidRootPart")
-	if hum and root and hum.Health > 0 then return root end
+-- ===== the home =====
+-- Returns the house's pivot lowered slightly, plus its scale.
+-- CFrame multiplication applies the right-hand offset in the LEFT frame's local space, so -0.3*scale moves along the
+-- house's own Y axis, not world Y (matters if a house is ever rotated).
+local function originOf(house: Model): (CFrame, number)
+	local scale = (house:GetAttribute("HouseScale") :: number?) or 1
+	return house:GetPivot() * CFrame.new(0, -0.3 * scale, 0), scale
+end
+
+-- Casts a ray straight down to find the floor height under `pos`.
+-- Raycast(origin, direction, params): `direction` is a displacement vector (length = max distance), NOT a unit vector.
+-- Starts 3 studs above pos and searches 14 studs down, so it can find a floor even if pos is slightly below it.
+local function floorAt(pos: Vector3, ignore: {Instance}): number
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude -- ignore the NPC and furniture so we hit the floor itself
+	params.FilterDescendantsInstances = ignore
+	local hit = workspace:Raycast(pos + Vector3.new(0, 3, 0), Vector3.new(0, -14, 0), params)
+	return hit and hit.Position.Y or pos.Y -- RaycastResult | nil; fall back to the given height
+end
+
+-- Finds the invisible "PowerZone" box part that covers one home of a terrace (matched through its Group attribute).
+local function zoneFor(house: Model, unit: number): BasePart?
+	local group = house.Name .. "#" .. unit
+	for _, z in ipairs(house:GetChildren()) do
+		if z.Name == "PowerZone" and z:GetAttribute("Group") == group then return z :: BasePart end
+	end
 	return nil
 end
 
-local function notify(player, text)
-	if Progression and player then Progression.notify(player, text) end
+-- Oriented-box point test. PointToObjectSpace converts a world point into the zone's local frame, so the zone can be
+-- rotated and the test stays a simple axis-aligned comparison against half the Size on each axis.
+local function inZone(zone: BasePart?, position: Vector3): boolean
+	if not zone then return false end
+	local lp = zone.CFrame:PointToObjectSpace(position)
+	local half = zone.Size / 2
+	return math.abs(lp.X) <= half.X and math.abs(lp.Y) <= half.Y and math.abs(lp.Z) <= half.Z
 end
 
-local function say(npc, text, seconds)
-	if Speech and npc and npc.Parent then pcall(Speech.say, npc, text, seconds or 3) end
+-- the furniture of one home, grouped by kind
+local function gather(house: Model, unit: number): PropMap
+	local props: PropMap = {}
+	local furniture = house:FindFirstChild("Furniture")
+	if furniture then
+		for _, prop in ipairs(furniture:GetChildren()) do
+			if prop:GetAttribute("Unit") == unit then
+				props[prop.Name] = props[prop.Name] or {}
+				table.insert(props[prop.Name], prop :: Model)
+			end
+		end
+	end
+	return props
 end
 
-local function hrpOf(npc) return npc and npc:FindFirstChild("HumanoidRootPart") end
-local function humOf(npc) return npc and npc:FindFirstChildOfClass("Humanoid") end
-
-local function groundPoint(position)
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = {npcFolder, workspace:FindFirstChild("Debris") or npcFolder}
-	local hit = workspace:Raycast(position + Vector3.new(0, 25, 0), Vector3.new(0, -80, 0), params)
-	return hit and hit.Position or position
+local function roomsOf(house: Model, unit: number): {Room}
+	local rooms: {Room} = {}
+	-- JSONDecode throws on invalid JSON (or on a nil attribute), hence the pcall
+	local ok, data = pcall(function(): RoomsPayload
+		return HttpService:JSONDecode(house:GetAttribute("RoomsJson") :: string)
+	end)
+	if not ok then return rooms end
+	local origin, scale = originOf(house)
+	local zone = zoneFor(house, unit)
+	for _, r in ipairs((data :: RoomsPayload).rooms) do
+		-- CFrame * Vector3 is CFrame:PointToWorldSpace: house-local room centre -> world position
+		local centre = origin * Vector3.new((r.x0 + r.x1) / 2 * scale, r.y * scale, (r.z0 + r.z1) / 2 * scale)
+		-- keep only rooms inside this unit's power zone (nudged up 3 studs so the floor point is inside the box)
+		if not zone or inZone(zone, centre + Vector3.new(0, 3, 0)) then
+			table.insert(rooms, {type = r.type, floor = r.floor, centre = centre,
+				w = (r.x1 - r.x0) * scale, d = (r.z1 - r.z0) * scale})
+		end
+	end
+	return rooms
 end
 
-local function face(npc, target)
-	local root = hrpOf(npc)
-	if not root then return end
-	local from = root.Position
-	local to = Vector3.new(target.X, from.Y, target.Z)
-	if (to - from).Magnitude < 0.05 then return end
-	root.CFrame = CFrame.lookAt(from, to)
+-- ===== moving about =====
+-- Yields. Returns true if the NPC ended up within ~4.5 studs (XZ) of `target`.
+local function walkTo(npc: Model, target: Vector3): boolean
+	local hum = npc:FindFirstChildOfClass("Humanoid")
+	local hrp = npc:FindFirstChild("HumanoidRootPart") :: BasePart?
+	if not hum or not hrp then return false end
+	if flat(hrp.Position, target) < 2.5 and math.abs(hrp.Position.Y - target.Y) < 5 then return true end
+
+	-- agent dimensions must fit doorways and furniture gaps; AgentCanJump allows jump waypoints (stairs, kerbs)
+	local path = PathfindingService:CreatePath({AgentRadius = 1.7, AgentHeight = 5.2, AgentCanJump = true, WaypointSpacing = 5})
+	local ok = pcall(function() path:ComputeAsync(hrp.Position, target) end) -- ComputeAsync yields and can throw
+	local started = os.clock() -- os.clock is a high-resolution monotonic timer, good for elapsed time
+	if ok and path.Status == Enum.PathStatus.Success then
+		for _, wp in ipairs(path:GetWaypoints()) do -- {PathWaypoint}: Position + Action
+			if aborted(npc) then return false end
+			if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
+			hum:MoveTo(wp.Position) -- non-blocking; Humanoid walks toward it (MoveTo times out after 8s)
+			local t = os.clock()
+			while flat(hrp.Position, wp.Position) > 2.3 and os.clock() - t < 3 do
+				if aborted(npc) then return false end
+				task.wait(0.1)
+			end
+			if os.clock() - started > 45 then break end -- never spend longer than 45s on one trip
+		end
+	else
+		-- no navmesh route: walk in a straight line and hope
+		hum:MoveTo(target)
+		local t = os.clock()
+		while flat(hrp.Position, target) > 2.5 and os.clock() - t < 6 do
+			if aborted(npc) then return false end
+			task.wait(0.1)
+		end
+	end
+	return flat(hrp.Position, target) < 4.5
 end
 
-local function anim(npc, name)
-	if not npc or not npc.Parent then return end
-	CollectionService:AddTag(npc, "NPCAnimated")
-	npc:SetAttribute("NPCAnimN", (npc:GetAttribute("NPCAnimN") or 0) + 1)
-	npc:SetAttribute("NPCAnim", name)
+-- NOTE: this local shadows the global `wait`. It is an "idle for N seconds, speaking now and then" helper.
+-- Returns false if the routine was aborted early (so callers can bail out).
+local function wait(npc: Model, seconds: number, lines: {string}?, every: number?): boolean
+	local t = os.clock()
+	local nextLine = os.clock() + (every or 9) * (0.5 + math.random()) -- math.random() is a float in [0,1)
+	while os.clock() - t < seconds do
+		if aborted(npc) then return false end
+		if lines and os.clock() >= nextLine then
+			say(npc, pick(lines))
+			nextLine = os.clock() + (every or 9) * (0.7 + math.random())
+		end
+		task.wait(0.25)
+	end
+	return true
 end
 
-local leftovers = {}
+-- ===== sitting and lying =====
+-- Frees a seated/lying NPC. keepPlace = true leaves him where he is (used when Occupancy evicts him).
+function Life.release(npc: Model, keepPlace: boolean?)
+	local S = residents[npc]
+	if not S then return end
+	if Occupancy then Occupancy.remove(npc) end
+	if S.posed then
+		S.posed = false
+		npc:SetAttribute("Pose", nil) -- setting an attribute to nil removes it
+	end
+	local hrp = npc:FindFirstChild("HumanoidRootPart") :: BasePart?
+	if hrp and S.placed then
+		S.placed = false
+		hrp.Anchored = false -- physics takes over again
+		if not keepPlace and S.exit then
+			hrp.CFrame = S.exit
+			hrp.AssemblyLinearVelocity = Vector3.zero -- kill any leftover momentum (replaces the deprecated .Velocity)
+		end
+	end
+	S.exit = nil
+end
 
-local function spawnNpc(templateName, position, lookAt)
-	local template = templates:FindFirstChild(templateName)
+function Life.wake(npc: Model) -- called when he is provoked, hit, grabbed...
+	Life.release(npc, false)
+end
+
+-- recursive = true: finds a named part anywhere below `prop`, not just a direct child
+local function partOf(prop: Instance, name: string): BasePart?
+	return prop:FindFirstChild(name, true) :: BasePart?
+end
+
+-- Builds the CFrame the HumanoidRootPart should have while seated.
+-- The NPC faces AWAY from the backrest (seat - back, flattened onto XZ), or toward `hint` if the seat has no back.
+local function sitCFrame(prop: Model, kind: string, hint: Vector3?): CFrame?
+	local seat: BasePart?, back: BasePart?
+	if kind == "Toilet" then
+		seat, back = partOf(prop, "Seat"), partOf(prop, "Tank")
+	elseif kind == "Sofa" then
+		local cushions: {BasePart} = {}
+		for _, d in ipairs(prop:GetDescendants()) do if d.Name == "Cushion" then cushions[#cushions + 1] = d :: BasePart end end
+		seat, back = cushions[math.random(math.max(#cushions, 1))], partOf(prop, "Back") -- random cushion; max() avoids random(0)
+	elseif kind == "Armchair" then
+		seat, back = partOf(prop, "Cushion"), partOf(prop, "Back")
+	elseif kind == "Chair" then
+		seat, back = partOf(prop, "Seat"), partOf(prop, "Back")
+	elseif kind == "Bar Stool" then
+		seat = partOf(prop, "Seat")
+	end
+	if not seat then return nil end
+	local face: Vector3?
+	if back then
+		face = Vector3.new(seat.Position.X - back.Position.X, 0, seat.Position.Z - back.Position.Z)
+	elseif hint then
+		face = Vector3.new(hint.X - seat.Position.X, 0, hint.Z - seat.Position.Z)
+	end
+	if not face or face.Magnitude < 0.05 then return nil end -- degenerate: seat and back at the same spot
+	face = face.Unit
+	local top = seat.Position.Y + seat.Size.Y / 2 -- top surface of the seat part
+	local pos = Vector3.new(seat.Position.X, top + SIT_LIFT, seat.Position.Z) - (back and face * 0.25 or Vector3.zero) -- nudge into the seat back
+	return CFrame.lookAt(pos, pos + face) -- position + orientation looking along `face` with world-up as the up hint
+end
+
+-- Builds the CFrame for lying on a bed. Head direction h = footboard -> headboard (flattened, unit).
+local function lieCFrame(prop: Model): CFrame?
+	local mat, head, foot = partOf(prop, "Mattress"), partOf(prop, "Headboard"), partOf(prop, "Footboard")
+	if not (mat and head and foot) then return nil end
+	local h = Vector3.new(head.Position.X - foot.Position.X, 0, head.Position.Z - foot.Position.Z)
+	if h.Magnitude < 0.05 then return nil end
+	h = h.Unit
+	local pos = mat.Position + Vector3.new(0, mat.Size.Y / 2 + LIE_LIFT, 0) + h * 0.4
+	-- CFrame.fromMatrix(pos, xAxis, yAxis, zAxis) builds a rotation from three basis vectors (zAxis is optional only when
+	-- the other two give a right-handed frame). Here: X = h rotated 90 deg about Y, Y(up of the character) = h,
+	-- Z = world down. Roblox characters look along -Z, so LookVector = world UP: he lies on his back, head toward h.
+	-- Check: X cross Y = (0,-1,0) = Z, so the basis is right-handed (a valid rotation, no mirroring).
+	return CFrame.fromMatrix(pos, Vector3.new(h.Z, 0, -h.X), h, Vector3.new(0, -1, 0))
+end
+
+-- walks to the prop, then sits or lies on it. Returns true once he is in place.
+local function settle(npc: Model, S: ResidentState, prop: Model, kind: string, pose: PoseName, lines: {string}?): boolean
+	local cf: CFrame?, approach: Vector3?, exit: Vector3?
+	local hint: Vector3?
+	if kind == "Bar Stool" then
+		local bar = S.props["Bar Counter"] and S.props["Bar Counter"][1]
+		hint = bar and bar:GetPivot().Position -- stools face the bar counter (they have no backrest part)
+	end
+	if pose == "Lie" then
+		cf = lieCFrame(prop)
+		if cf then
+			-- Pick the side of the bed the NPC stands on: Dot > 0 means the prop centre is on the +Right side,
+			-- so the exit point goes to the opposite (-Right) side.
+			local across = cf.RightVector
+			local side = (prop:GetPivot().Position - cf.Position)
+			local out = across * (side:Dot(across) > 0 and -1 or 1)
+			approach = cf.Position + out * 3.4
+			exit = cf.Position + out * 3.4
+		end
+	else
+		cf = sitCFrame(prop, kind, hint)
+		if cf then
+			approach = cf.Position + cf.LookVector * 2.8 -- stand in front of the seat first
+			exit = approach
+		end
+	end
+	if not cf or not approach or not exit then return false end
+	local ignore: {Instance} = {npc, prop.Parent :: Instance}
+	approach = Vector3.new(approach.X, floorAt(approach, ignore) + 3.2, approach.Z) -- snap to the floor (+3.2 = root height)
+	exit = Vector3.new(exit.X, approach.Y, exit.Z)
+	if not walkTo(npc, approach) then return false end
+	if aborted(npc) then return false end
+
+	local hum = npc:FindFirstChildOfClass("Humanoid") :: Humanoid
+	local hrp = npc:FindFirstChild("HumanoidRootPart") :: BasePart
+	hum:MoveTo(hrp.Position)                    -- cancels any walk in progress
+	hrp.AssemblyLinearVelocity = Vector3.zero   -- zero linear velocity of the whole assembly
+	hrp.Anchored = true                         -- frozen by the engine: no physics, no Humanoid pushing him off the seat
+	hrp.CFrame = cf                             -- teleport onto the seat/bed (anchored parts keep this exactly)
+	S.placed = true
+	-- CFrame.new(pos) * rotation: `cf.Rotation` is the CFrame with the translation stripped (pure rotation).
+	-- Lying: stand up facing +90 deg about Y relative to the bed axis; sitting: keep the seat's facing.
+	S.exit = CFrame.new(exit) * (pose == "Lie" and CFrame.Angles(0, math.rad(90), 0) or cf.Rotation)
+	-- sitting and lying are poses played on him (arms down, nothing else moving; sitting also looks around)
+	CollectionService:AddTag(npc, "Posed")
+	npc:SetAttribute("Pose", pose)
+	S.posed = true
+	if Occupancy then Occupancy.add(prop, npc, function(n: Model) Life.release(n, true) end) end
+	return true
+end
+
+-- ===== activities =====
+-- Weighted random pick. `list` is {{weight, fn}, ...}; the cumulative-subtract loop is the standard roulette-wheel method.
+local function choose(list: {{any}}): Activity_fn
+	local total = 0
+	for _, e in ipairs(list) do total += e[1] :: number end
+	local r = math.random() * total
+	for _, e in ipairs(list) do
+		r -= e[1] :: number
+		if r <= 0 then return e[2] :: Activity_fn end
+	end
+	return (list[1] and list[1][2]) :: Activity_fn
+end
+
+-- Picks a random FREE prop of any of the given names (on S.floorOnly if set). Returns the prop and the name it matched.
+local function firstOf(S: ResidentState, ...: string): (Model?, string?)
+	local options: {{any}} = {}
+	for _, name in ipairs({...}) do
+		for _, p in ipairs(S.props[name] or {}) do
+			if p.Parent and (not S.floorOnly or p:GetAttribute("Floor") == S.floorOnly) and (not Occupancy or #Occupancy.occupantsOf(p) == 0) then
+				options[#options + 1] = {p, name}
+			end
+		end
+	end
+	if #options == 0 then return nil end
+	local o = options[math.random(#options)]
+	return o[1] :: Model, o[2] :: string
+end
+
+local function doSit(npc: Model, S: ResidentState, kinds: {string}, label: Activity, lines: {string}?, secondsRange: {number}): boolean
+	local prop, kind = firstOf(S, table.unpack(kinds)) -- table.unpack spreads the array into varargs
+	if not prop or not kind then return false end
+	S.activity = label
+	if settle(npc, S, prop, kind, "Sit") then
+		wait(npc, math.random(secondsRange[1], secondsRange[2]), lines, 8)
+	end
+	Life.release(npc, false)
+	return true
+end
+
+local function actTV(npc: Model, S: ResidentState): boolean return doSit(npc, S, {"Sofa", "Armchair"}, "tv", TV, {35, 90}) end
+local function actEat(npc: Model, S: ResidentState): boolean return doSit(npc, S, {"Chair"}, "eat", EAT, {20, 45}) end
+local function actToilet(npc: Model, S: ResidentState): boolean return doSit(npc, S, {"Toilet"}, "toilet", nil, {12, 28}) end
+local function actPub(npc: Model, S: ResidentState): boolean return doSit(npc, S, {"Bar Stool", "Chair"}, "pub", PUB, {30, 80}) end
+-- the lounge upstairs: sit on its chairs and sofas only
+local function actLounge(npc: Model, S: ResidentState): boolean
+	S.floorOnly = 1
+	local ok = doSit(npc, S, {"Chair", "Sofa", "Armchair"}, "pub", PUB, {40, 110})
+	S.floorOnly = nil
+	return ok
+end
+
+local function actSleep(npc: Model, S: ResidentState): boolean
+	local prop = firstOf(S, "Single Bed", "Double Bed")
+	if not prop then return false end
+	S.activity = "sleep"
+	if settle(npc, S, prop, "Bed", "Lie") then
+		wait(npc, math.random(50, 120), SLEEP, 14)
+	end
+	Life.release(npc, false)
+	return true
+end
+
+local function actCook(npc: Model, S: ResidentState): boolean
+	local prop = firstOf(S, "Cooker", "Kitchen Unit", "Fridge")
+	if not prop then return false end
+	S.activity = "cook"
+	local pos = prop:GetPivot().Position
+	local toward = (S.roomCentreOf and S.roomCentreOf(pos)) or pos -- face into the room, so he stands in front of the cooker
+	local dir = Vector3.new(toward.X - pos.X, 0, toward.Z - pos.Z)
+	dir = dir.Magnitude > 0.5 and dir.Unit or Vector3.new(0, 0, -1) -- fallback direction when the vector is ~zero
+	local spot = pos + dir * 3.2
+	spot = Vector3.new(spot.X, floorAt(spot, {npc, prop.Parent :: Instance}) + 3.2, spot.Z)
+	if walkTo(npc, spot) then
+		local hrp = npc:FindFirstChild("HumanoidRootPart") :: BasePart?
+		-- lookAt with the target's Y set to the NPC's own Y so he turns on the spot without tilting
+		if hrp then hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(pos.X, hrp.Position.Y, pos.Z)) end
+		wait(npc, math.random(15, 35), COOK, 7)
+	end
+	return true
+end
+
+local function actWander(npc: Model, S: ResidentState): boolean
+	local room = S.rooms[math.random(#S.rooms)] -- math.random(0) would error, but #rooms is >= 1 for any spawned resident
+	if not room then return false end
+	S.activity = "wander"
+	-- random offset inside the room, keeping a 2.5-stud margin from the walls on each side (room size - 5)
+	local offset = Vector3.new((math.random() - 0.5) * math.max(room.w - 5, 0), 0, (math.random() - 0.5) * math.max(room.d - 5, 0))
+	local target = room.centre + offset
+	target = Vector3.new(target.X, floorAt(target, {npc, S.house:FindFirstChild("Furniture") :: Instance}) + 3.2, target.Z)
+	walkTo(npc, target)
+	if math.random() < 0.6 then say(npc, pick(SOLO)) end
+	wait(npc, math.random(4, 10))
+	return true
+end
+
+-- conversations: one walks over to another resident and they trade lines
+local function actChat(npc: Model, S: ResidentState): boolean
+	local partner: Model?
+	for other, os_ in pairs(residents) do -- `os_` avoids shadowing the `os` library
+		if other ~= npc and os_.house == S.house and os_.unit == S.unit and alive(other) and not busy(other)
+			and os_.activity ~= "sleep" and os_.activity ~= "toilet" and os_.activity ~= "outside" and not os_.chatting then
+			partner = other
+			break
+		end
+	end
+	if not partner then return false end
+	S.activity = "chat"
+	S.chatting = true
+	residents[partner].chatting = true
+	local pRoot = partner:FindFirstChild("HumanoidRootPart") :: BasePart?
+	local root = npc:FindFirstChild("HumanoidRootPart") :: BasePart?
+	if pRoot and root and flat(pRoot.Position, root.Position) > 5.5 then
+		-- stand 4.2 studs from the partner, on the side he is already on (unit vector from partner to me, flattened)
+		local toward = (root.Position - pRoot.Position) * Vector3.new(1, 0, 1)
+		local stand = pRoot.Position + (toward.Magnitude > 0.1 and toward.Unit or Vector3.new(1, 0, 0)) * 4.2
+		walkTo(npc, Vector3.new(stand.X, pRoot.Position.Y, stand.Z))
+	end
+	if not aborted(npc) and not aborted(partner) then
+		-- face each other
+		if pRoot and root then
+			root.CFrame = CFrame.lookAt(root.Position, Vector3.new(pRoot.Position.X, root.Position.Y, pRoot.Position.Z))
+			if not residents[partner].placed then -- do not rotate a partner who is anchored on a seat
+				pRoot.CFrame = CFrame.lookAt(pRoot.Position, Vector3.new(root.Position.X, pRoot.Position.Y, root.Position.Z))
+			end
+		end
+		for _ = 1, math.random(1, 3) do
+			local pair = pick(PAIRS)
+			say(npc, pair[1])
+			if not wait(npc, 3.4) then break end
+			say(partner, pair[2])
+			if not wait(npc, 3.6) then break end
+		end
+	end
+	S.chatting = false
+	if residents[partner] then residents[partner].chatting = false end -- partner may have despawned meanwhile
+	return true
+end
+
+-- the bartender works behind the bar, between the counter and the back bar shelves
+local function actBartend(npc: Model, S: ResidentState): boolean
+	local bar = S.props["Bar Counter"] and S.props["Bar Counter"][1]
+	if not bar then return false end
+	S.activity = "bartend"
+	local counter = bar:GetPivot().Position
+	local shelf = S.props["Back Bar Shelf"] and S.props["Back Bar Shelf"][1]
+	local back = shelf and shelf:GetPivot().Position or (counter + Vector3.new(0, 0, 4))
+	local middle = Vector3.new((counter.X + back.X) / 2, counter.Y, (counter.Z + back.Z) / 2) -- midpoint of the working lane
+	-- (x, z) -> (-z, x) is a 90 degree rotation on the XZ plane: a vector running ALONG the counter
+	local along = Vector3.new(-(back.Z - counter.Z), 0, back.X - counter.X)
+	along = along.Magnitude > 0.1 and along.Unit or Vector3.new(1, 0, 0)
+	local spot = middle + along * (math.random() * 6 - 3) -- random spot within +-3 studs along the counter
+	spot = Vector3.new(spot.X, floorAt(spot, {npc, S.house:FindFirstChild("Furniture") :: Instance}) + 3.2, spot.Z)
+	walkTo(npc, spot)
+	local hrp = npc:FindFirstChild("HumanoidRootPart") :: BasePart?
+	if hrp then hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(counter.X, hrp.Position.Y, counter.Z)) end
+	wait(npc, math.random(15, 40), BARTENDER, 11)
+	return true
+end
+
+-- stepping outside through the front door (who has a key) and back in
+-- Returns the doors whose INSIDE point (3 studs behind the door leaf) falls in this unit's power zone.
+local function doorsOf(house: Model, unit: number): {Model}
+	local list: {Model} = {}
+	for _, d in ipairs(house:GetChildren()) do
+		if d:IsA("Model") and CollectionService:HasTag(d, "HouseDoor") and d.PrimaryPart then
+			list[#list + 1] = d
+		end
+	end
+	local zone = zoneFor(house, unit)
+	local mine: {Model} = {}
+	for _, d in ipairs(list) do
+		local pp = d.PrimaryPart :: BasePart
+		-- LookVector points OUT of the house, so minus LookVector * 3 is a point just inside
+		local inside = pp.Position - pp.CFrame.LookVector * 3
+		if inZone(zone, inside + Vector3.new(0, 1, 0)) then mine[#mine + 1] = d end
+	end
+	return mine
+end
+
+-- `DoorControl` is a BindableEvent in ServerScriptService; Fire() triggers DoorServer's handler on the server side
+local doorControl: BindableEvent?
+local function setDoor(door: Model, action: "open" | "close")
+	doorControl = doorControl or ServerScriptService:FindFirstChild("DoorControl") :: BindableEvent? -- cached after first lookup
+	if doorControl then doorControl:Fire(door, action) end
+end
+
+local function goOutThenIn(npc: Model, S: ResidentState): boolean
+	local doors = doorsOf(S.house, S.unit)
+	local door = doors[1]
+	if not door then return false end
+	local leaf = door.PrimaryPart :: BasePart
+	local out = leaf.CFrame.LookVector -- unit vector pointing away from the house
+	local ignore: {Instance} = {npc, S.house:FindFirstChild("Furniture") :: Instance}
+	local insideSpot = leaf.Position - out * 3.4
+	local outsideSpot = leaf.Position + out * 4
+	insideSpot = Vector3.new(insideSpot.X, floorAt(insideSpot, ignore) + 3.2, insideSpot.Z)
+	outsideSpot = Vector3.new(outsideSpot.X, floorAt(outsideSpot, ignore) + 3.2, outsideSpot.Z)
+	S.activity = "outside"
+	if not walkTo(npc, insideSpot) then return true end
+	setDoor(door, "open")
+	task.wait(0.7) -- let the door swing before pathing through it
+	walkTo(npc, outsideSpot)
+	setDoor(door, "close")
+	if not aborted(npc) then
+		say(npc, pick({"Getting some air.", "Nice out. Well, nearly.", "Just popping out for a bit."}))
+		wait(npc, math.random(8, 18))
+	end
+	-- back in
+	if not aborted(npc) then
+		setDoor(door, "open")
+		task.wait(0.7)
+		walkTo(npc, insideSpot)
+		setDoor(door, "close")
+	end
+	return true
+end
+
+-- if he ends up outside the home (chased somebody out), he goes back in through his door
+local function goHome(npc: Model, S: ResidentState)
+	local root = npc:FindFirstChild("HumanoidRootPart") :: BasePart
+	if inZone(S.zone, root.Position) then return end
+	local door = doorsOf(S.house, S.unit)[1]
+	if not door then return end
+	local leaf = door.PrimaryPart :: BasePart
+	local out = leaf.CFrame.LookVector
+	local ignore: {Instance} = {npc, S.house:FindFirstChild("Furniture") :: Instance}
+	local outsideSpot = leaf.Position + out * 4
+	local insideSpot = leaf.Position - out * 3.4
+	outsideSpot = Vector3.new(outsideSpot.X, floorAt(outsideSpot, ignore) + 3.2, outsideSpot.Z)
+	insideSpot = Vector3.new(insideSpot.X, floorAt(insideSpot, ignore) + 3.2, insideSpot.Z)
+	if walkTo(npc, outsideSpot) then
+		setDoor(door, "open")
+		task.wait(0.7)
+		walkTo(npc, insideSpot)
+		setDoor(door, "close")
+	end
+end
+
+-- ===== the routine =====
+-- "Daylight" is a Workspace attribute (0..1) published by WeatherServer; below 0.25 counts as night.
+local function nightTime(): boolean
+	local daylight = workspace:GetAttribute("Daylight")
+	return type(daylight) == "number" and daylight < 0.25
+end
+
+local function pickActivity(S: ResidentState): Activity_fn
+	if S.role == "bartender" then return actBartend end
+	if S.upstairs then return choose({{8, actLounge}, {1, actChat}}) end
+	local night = nightTime()
+	-- weights are relative, not percentages: sleep is 5 at night vs 0.5 by day (10x likelier)
+	local options: {{any}} = {
+		{night and 0.8 or 2.4, actTV}, {2, actEat}, {2, actCook}, {1.4, actToilet},
+		{night and 5 or 0.5, actSleep}, {2, actWander}, {2.2, actChat}, {0.6, goOutThenIn},
+	}
+	if S.house.Name:find("Pub") and (S.role ~= "landlord") then
+		table.insert(options, {5, actPub})
+	end
+	return choose(options)
+end
+
+-- the routine of one resident, plus watching for strangers
+-- `provoke` is supplied by the NPC brain: called with the intruder's character to start the fight.
+function Life.start(npc: Model, provoke: (char: Model) -> ())
+	local S = residents[npc]
+	if not S then return end
+	S.zone = zoneFor(S.house, S.unit)
+	S.props = gather(S.house, S.unit)
+	S.rooms = roomsOf(S.house, S.unit)
+	S.seen = {}
+	-- closure: centre of the room nearest to `pos` (flat distance)
+	S.roomCentreOf = function(pos: Vector3): Vector3?
+		local best: Vector3?, bestD: number?
+		for _, r in ipairs(S.rooms) do
+			local d = flat(r.centre, pos)
+			if not bestD or d < bestD then best, bestD = r.centre, d end
+		end
+		return best
+	end
+
+	-- strangers (runs 2x per second on its own thread)
+	task.spawn(function()
+		local spotted = 0
+		while npc.Parent and alive(npc) do
+			task.wait(0.5)
+			if not S.zone or not S.zone.Parent then S.zone = zoneFor(S.house, S.unit) end -- zone may stream in later
+			if not npc:GetAttribute("Aggro") then
+				for _, plr in ipairs(Players:GetPlayers()) do
+					local char = plr.Character
+					local root = char and char:FindFirstChild("HumanoidRootPart") :: BasePart?
+					local hum = char and char:FindFirstChildOfClass("Humanoid")
+					-- a pub or shop is open to everyone: its people are only hostile to somebody with a bounty
+					local publicPlace = S.house.Name:find("Pub") or S.house.Name:find("Corner Shop") or S.house:GetAttribute("ShopKind") ~= nil
+					local unwelcome = (not publicPlace) or plr:GetAttribute("BountyActive")
+					if unwelcome and root and hum and hum.Health > 0 and inZone(S.zone, root.Position) and Alert and Alert.canSee(npc, char :: Model, 34) then
+						S.seen[plr] = (S.seen[plr] or 0) + 0.5 -- +0.5s per tick of visible trespass
+						-- somebody asleep takes longer to notice
+						local needed = S.activity == "sleep" and 3 or 1
+						if S.seen[plr] >= needed then
+							S.seen[plr] = 0
+							if publicPlace then
+								say(npc, pick({"Oi! You're the one they're after!", "Get out! I know who you are!", "Wanted, aren't you?!"}))
+							else
+								say(npc, pick(TRESPASS))
+								Alert.crime(plr, 45, root.Position) -- spotted in somebody's home: they phone the police (heat 2)
+							end
+							provoke(char :: Model)
+						end
+					else
+						S.seen[plr] = math.max((S.seen[plr] or 0) - 0.25, 0) -- suspicion decays when you are out of sight
+					end
+				end
+				-- power cut: the PowerZone's "Dark" attribute is flipped by PowerServer
+				if S.zone and S.zone:GetAttribute("Dark") and not S.reactedToDark then
+					S.reactedToDark = true
+					say(npc, pick(POWER))
+				elseif S.zone and not S.zone:GetAttribute("Dark") then
+					S.reactedToDark = false
+				end
+			end
+		end
+	end)
+
+	-- the day
+	task.spawn(function()
+		task.wait(1 + math.random()) -- stagger so a whole street does not start in the same frame
+		while npc.Parent and alive(npc) and not S.gone do
+			if busy(npc) then
+				task.wait(0.5)
+			else
+				goHome(npc, S)
+				local activity = pickActivity(S)
+				local ok, did = pcall(activity, npc, S) -- one bad activity must not kill the whole routine
+				if not ok then warn("[ResidentLife] " .. tostring(did)) end
+				S.activity = nil
+				Life.release(npc, false)
+				if not did then task.wait(1.5) end -- failed (no free prop): back off a moment
+				wait(npc, 1.5 + math.random() * 3)
+			end
+		end
+	end)
+end
+
+-- ===== spawning =====
+local function countFor(house: Model): number
+	if house.Name:find("Pub") then return 6 end
+	if house.Name:find("Council") or house.Name:find("Shop") or house:GetAttribute("ShopKind") then return 2 end
+	return math.random() < 0.55 and 2 or 1 -- 55% two residents, 45% one
+end
+
+function Life.spawn(house: Model, unit: number, role: ResidentRole, upstairs: boolean?): Model?
+	local ServerNPCs = ServerStorage:FindFirstChild("NPCTemplates")
+	local template = ServerNPCs and ServerNPCs:FindFirstChild("Resident") :: Model?
 	if not template then return nil end
+	folder = folder or (workspace:FindFirstChild("Residents") :: Folder?) or Instance.new("Folder")
+	local f = folder :: Folder
+	f.Name = "Residents"
+	f.Parent = workspace
+
+	local rooms = roomsOf(house, unit)
+	if #rooms == 0 then return nil end
+	local ground: {Room} = {}
+	for _, r in ipairs(rooms) do if r.floor == 0 then ground[#ground + 1] = r end end
+	local room = #ground > 0 and ground[math.random(#ground)] or rooms[1]
+	if upstairs then
+		local up: {Room} = {}
+		for _, r in ipairs(rooms) do if r.floor == 1 then up[#up + 1] = r end end
+		if #up > 0 then room = up[math.random(#up)] end
+	end
+	local pos = room.centre + Vector3.new((math.random() - 0.5) * math.max(room.w - 6, 0), 0, (math.random() - 0.5) * math.max(room.d - 6, 0))
+	pos = Vector3.new(pos.X, floorAt(pos, {house:FindFirstChild("Furniture") :: Instance}) + 3.4, pos.Z)
+
 	local npc = template:Clone()
-	local yaw = math.rad(math.random(0, 359))
-	local cf = CFrame.new(position + Vector3.new(0, 3.5, 0)) * CFrame.Angles(0, yaw, 0)
-	if lookAt then cf = CFrame.lookAt(cf.Position, Vector3.new(lookAt.X, cf.Position.Y, lookAt.Z)) end
-	npc:PivotTo(cf)
-	npc:SetAttribute("BenchBusy", true)
-	npc:SetAttribute("EventNPC", true)
-	npc.Parent = npcFolder
-	local hum = humOf(npc)
-	if hum then npc:SetAttribute("BaseSpeed", hum.WalkSpeed) end
+	npc.Name = "Resident"
+	npc:SetAttribute("NPCType", "Regular") -- tells the NPC brain which AI to run
+	npc:SetAttribute("Unit", unit)
+	residents[npc] = {house = house, unit = unit, role = role, props = {}, rooms = {}, upstairs = upstairs, seen = {}}
+	local root = npc:FindFirstChild("HumanoidRootPart") :: BasePart
+	-- PivotTo moves the whole model so that a chosen point lands exactly where we want.
+	-- offset = pivot^-1 * root  (the root expressed in the pivot's local space, via ToObjectSpace)
+	-- pivot' = CFrame.new(pos) * offset^-1  =>  pivot' * offset = CFrame.new(pos), i.e. the ROOT ends up at pos
+	-- (the model's pivot is lower than the root, so pivoting straight to pos would sink him into the floor).
+	npc:PivotTo(CFrame.new(pos) * npc:GetPivot():ToObjectSpace(root.CFrame):Inverse())
+	npc.Parent = f -- parent LAST so scripts that read the start position see the final CFrame
+	if role == "bartender" then
+		npc:SetAttribute("Bartender", true)
+		CollectionService:AddTag(npc, "Bartender") -- tag lets the BarServer find the bartender with GetTagged
+	end
+	-- Destroying fires BEFORE the instance is removed; mark the state gone so every running loop exits cleanly
+	npc.Destroying:Connect(function()
+		local S = residents[npc]
+		if S then S.gone = true end
+		if Occupancy then Occupancy.remove(npc) end
+		residents[npc] = nil
+	end)
 	return npc
 end
 
-local function release(npc)
-	if not npc or not npc.Parent then return end
-	anim(npc, nil)
-	npc:SetAttribute("BenchBusy", nil)
-	npc:SetAttribute("EventNPC", nil)
-	local hum = humOf(npc)
-	if hum and npc:GetAttribute("BaseSpeed") then hum.WalkSpeed = npc:GetAttribute("BaseSpeed") end
-	leftovers[npc] = os.clock()
+local function nearestPlayerDistance(position: Vector3): number
+	local best = math.huge
+	for _, p in ipairs(Players:GetPlayers()) do
+		local root = p.Character and p.Character:FindFirstChild("HumanoidRootPart") :: BasePart?
+		if root then best = math.min(best, (root.Position - position).Magnitude) end -- 3D distance
+	end
+	return best
 end
 
-local function sidewalkSpot(center, minD, maxD)
-	local parts = Sidewalk.sidewalksNear(center, maxD)
-	if #parts == 0 then return nil end
-	for _ = 1, 30 do
-		local part = parts[math.random(#parts)]
-		if part and part:IsA("BasePart") then
-			local pos = Sidewalk.randomPoint(part)
-			local d = flat(pos - center).Magnitude
-			if d >= minD and d <= maxD and not (Visibility and Visibility.seen(pos)) then return pos end
-		end
+local homes: {[Model]: {[number]: {Model}}} = {} -- [house] = {[unit] = {npcs}}
+
+-- every house with room data, found once and then kept up to date (scanning the whole map every few seconds froze the server)
+local houseList: {Model}, houseSet: {[Model]: boolean} = {}, {}
+local function noteHouse(inst: Instance)
+	if inst:IsA("Model") and not houseSet[inst] and inst:GetAttribute("RoomsJson") then
+		houseSet[inst] = true
+		houseList[#houseList + 1] = inst
 	end
-	return nil
 end
-
-local function makeContext(player)
-	local ctx = {player = player, actors = {}, ended = false}
-	function ctx:pos()
-		local root = rootOf(player)
-		return root and root.Position or nil
-	end
-	function ctx:alive()
-		return not self.ended and player.Parent ~= nil and rootOf(player) ~= nil
-	end
-	function ctx:wait(seconds)
-		local untilTime = os.clock() + seconds
-		while os.clock() < untilTime do
-			if not self:alive() then return false end
-			task.wait(math.min(0.2, math.max(untilTime - os.clock(), 0.03)))
-		end
-		return self:alive()
-	end
-	function ctx:track(thing)
-		table.insert(self.actors, thing)
-		return thing
-	end
-	function ctx:near(position, range)
-		local p = self:pos()
-		return p ~= nil and (p - position).Magnitude <= range
-	end
-	function ctx:hint(position, range, text)
-		if self:near(position, range) then notify(player, text) end
-	end
-	function ctx:finish()
-		self.ended = true
-		for _, actor in ipairs(self.actors) do
-			if typeof(actor) == "Instance" then
-				if actor:GetAttribute("EventNPC") then release(actor) else actor:Destroy() end
-			elseif type(actor) == "table" then
-				pcall(function() actor:destroy() end)
-			elseif type(actor) == "function" then
-				pcall(actor)
-			end
-		end
-		self.actors = {}
-	end
-	return ctx
-end
-
-local function flee(npc, from, distance, speed)
-	local hum, root = humOf(npc), hrpOf(npc)
-	if not hum or not root then return end
-	local dir = flat(root.Position - from)
-	if dir.Magnitude < 0.1 then dir = Vector3.new(math.random() - 0.5, 0, math.random() - 0.5) end
-	hum.WalkSpeed = speed or 20
-	hum:MoveTo(root.Position + dir.Unit * (distance or 80))
-end
-
-local function hitSound(root)
-	if FightSounds and FightSounds.Hit and root then pcall(FightSounds.play3D, FightSounds.Hit, root, 0.8) end
-end
-
-local events = {}
-
-local FIGHT_LINES = {"Say that again!", "You what, mate?!", "Come on then!", "Pick on someone your own size!", "You owe me money!", "Stay down!", "Is that all you've got?"}
-events.StreetFight = {weight = 3, run = function(ctx)
-	local spot = sidewalkSpot(ctx:pos(), 45, 120)
-	if not spot then return false end
-	local a = spawnNpc("Regular", spot + Vector3.new(-1.5, 0, 0))
-	local b = spawnNpc("Regular", spot + Vector3.new(1.5, 0, 0))
-	if not a or not b then return false end
-	ctx:track(a)
-	ctx:track(b)
-	face(a, b:GetPivot().Position)
-	face(b, a:GetPivot().Position)
-	if Alert then Alert.makeNoise(spot, 55) end
-	ctx:hint(spot, 140, "You hear a fight kick off nearby.")
-
-	local turn = 0
-	local started = os.clock()
-	while os.clock() - started < 28 and ctx:alive() do
-		local attacker, defender = a, b
-		if turn % 2 == 1 then attacker, defender = b, a end
-		turn += 1
-		local aRoot, dRoot, dHum = hrpOf(attacker), hrpOf(defender), humOf(defender)
-		if not (aRoot and dRoot and dHum) then break end
-		face(attacker, dRoot.Position)
-		anim(attacker, "NPCSwing")
-		if not ctx:wait(0.28) then break end
-		if dHum.Health > 16 then dHum:TakeDamage(math.random(3, 6)) end
-		local push = flat(dRoot.Position - aRoot.Position)
-		if push.Magnitude > 0.1 then dRoot:ApplyImpulse(push.Unit * dRoot.AssemblyMass * 9) end
-		hitSound(dRoot)
-		if math.random() < 0.3 then say(attacker, pick(FIGHT_LINES), 2) end
-		if not ctx:wait(0.6 + math.random() * 0.5) then break end
-		face(defender, aRoot.Position)
-	end
-
-	if a.Parent and b.Parent then
-		local loser, winner = a, b
-		if (humOf(a) and humOf(b)) and humOf(a).Health > humOf(b).Health then loser, winner = b, a end
-		anim(a, nil)
-		anim(b, nil)
-		if RagdollUtil then pcall(RagdollUtil.ragdollFor, loser, 4) end
-		say(winner, pick({"Yeah! Stay down!", "Told you.", "Don't ever test me again."}), 3)
-		ctx:wait(4)
-		flee(winner, hrpOf(loser) and hrpOf(loser).Position or spot, 60, 14)
-		ctx:wait(6)
-	end
-	return true
-end}
-
-local RIOT_LINES = {"NO JUSTICE, NO PEACE!", "Burn it down!", "Power to the people!", "Enough is enough!", "WHOSE STREETS?!", "We want answers!", "Down with the council!"}
-events.Riot = {weight = 1, run = function(ctx)
-	local spot = sidewalkSpot(ctx:pos(), 70, 140)
-	if not spot then return false end
-	local crowd = {}
-	for i = 1, 9 do
-		local at = groundPoint(spot + Vector3.new((math.random() - 0.5) * 18, 0, (math.random() - 0.5) * 18))
-		local npc = spawnNpc(i % 3 == 0 and "Drunk" or "Regular", at, spot)
-		if npc then
-			ctx:track(npc)
-			table.insert(crowd, npc)
-		end
-	end
-	if #crowd < 3 then return false end
-	if Alert then Alert.makeNoise(spot, 70) end
-	ctx:hint(spot, 170, "Chanting and breaking glass echo down the street. A riot has broken out.")
-
-	local ignite = ServerScriptService:FindFirstChild("IgniteTarget")
-	local started = os.clock()
-	local nextDamage, nextLine, nextNoise = os.clock() + 4, os.clock() + 2, os.clock() + 6
-	while os.clock() - started < 55 and ctx:alive() do
-		for _, npc in ipairs(crowd) do
-			if npc.Parent and math.random() < 0.45 then
-				anim(npc, pick({"Cheer", "Shout", "Cheer"}))
-				local hum = humOf(npc)
-				if hum and math.random() < 0.5 then
-					hum.WalkSpeed = 15
-					hum:MoveTo(groundPoint(spot + Vector3.new((math.random() - 0.5) * 24, 0, (math.random() - 0.5) * 24)))
-				end
-			end
-		end
-		if os.clock() > nextLine then
-			nextLine = os.clock() + 2.5
-			say(pick(crowd), pick(RIOT_LINES), 2.5)
-		end
-		if os.clock() > nextNoise then
-			nextNoise = os.clock() + 8
-			if Alert then Alert.makeNoise(spot, 60) end
-		end
-		if os.clock() > nextDamage and Destructibles then
-			nextDamage = os.clock() + 5
-			local params = OverlapParams.new()
-			for _, part in ipairs(workspace:GetPartBoundsInRadius(spot, 30, params)) do
-				local prop = Destructibles.of and Destructibles.of(part)
-				if prop and not prop:GetAttribute("Held") then
-					pcall(Destructibles.damage, prop, 70, nil, "npc")
-					if ignite and prop.Parent and CollectionService:HasTag(prop, "Flammable") and math.random() < 0.4 then ignite:Fire(prop) end
-					break
-				end
-			end
-		end
-		if not ctx:wait(1.5) then break end
-	end
-
-	for _, npc in ipairs(crowd) do
-		anim(npc, nil)
-		flee(npc, spot, 90, 20)
-	end
-	ctx:wait(7)
-	return true
-end}
-
-events.Mugging = {weight = 2, run = function(ctx)
-	local spot = sidewalkSpot(ctx:pos(), 40, 110)
-	if not spot then return false end
-	local victim = spawnNpc("Coward", spot)
-	local thug = spawnNpc("Regular", spot + Vector3.new(3.2, 0, 0))
-	if not victim or not thug then return false end
-	ctx:track(victim)
-	ctx:track(thug)
-	face(victim, thug:GetPivot().Position)
-	face(thug, victim:GetPivot().Position)
-	anim(victim, "HandsUp")
-	anim(thug, "Shout")
-	ctx:hint(spot, 120, "Someone nearby is being mugged.")
-	say(thug, pick({"Wallet. Now.", "Hand it over, nice and slow.", "Don't be a hero. Wallet."}), 3)
-	say(victim, pick({"Please, I've got kids!", "Take it, take it!", "Don't hurt me!"}), 3)
-
-	local stopped = false
-	local started = os.clock()
-	while os.clock() - started < 14 and ctx:alive() do
-		local thugRoot = hrpOf(thug)
-		local playerPos = ctx:pos()
-		if not thugRoot or (humOf(thug) and humOf(thug).Health < humOf(thug).MaxHealth * 0.9) then stopped = true break end
-		if playerPos and (playerPos - thugRoot.Position).Magnitude < 11 then stopped = true break end
-		if not ctx:wait(0.4) then break end
-	end
-
-	if stopped then
-		anim(thug, nil)
-		say(thug, pick({"Mind your own business!", "Not worth it. Leg it!", "You didn't see anything!"}), 3)
-		flee(thug, ctx:pos() or spot, 90, 24)
-		anim(victim, nil)
-		say(victim, "Thank you, thank you! Here, take this.", 3)
-		local cash = ctx.player:FindFirstChild("Cash")
-		local reward = math.random(10, 35)
-		if cash then cash.Value += reward end
-		notify(ctx.player, "You scared off a mugger. The victim gives you $" .. reward)
-	elseif ctx:alive() then
-		anim(thug, "NPCSwing")
-		ctx:wait(0.35)
-		anim(victim, nil)
-		if RagdollUtil then pcall(RagdollUtil.ragdollFor, victim, 3) end
-		say(victim, "HELP! I've been robbed!", 3)
-		flee(thug, hrpOf(victim) and hrpOf(victim).Position or spot, 100, 22)
-	end
-	ctx:wait(8)
-	return true
-end}
-
-events.PlayerMugging = {weight = 1.5, run = function(ctx)
-	local playerPos = ctx:pos()
-	local cash = ctx.player:FindFirstChild("Cash")
-	if not playerPos or not cash or cash.Value < 10 then return false end
-	local spot = sidewalkSpot(playerPos, 35, 70)
-	if not spot then return false end
-	local thug = spawnNpc("Regular", spot, playerPos)
-	if not thug then return false end
-	ctx:track(thug)
-	local hum, root = humOf(thug), hrpOf(thug)
-	if not hum or not root then return false end
-	hum.WalkSpeed = 15
-
-	local arrived = false
-	local started = os.clock()
-	while os.clock() - started < 30 and ctx:alive() and thug.Parent and hum.Health > 0 do
-		local p = ctx:pos()
-		if not p then break end
-		if (p - root.Position).Magnitude < 6.5 then arrived = true break end
-		hum:MoveTo(p)
-		ctx:wait(0.4)
-	end
-	if not arrived or hum.Health <= 0 then return true end
-
-	hum:MoveTo(root.Position)
-	face(thug, ctx:pos())
-	anim(thug, "Shout")
-	say(thug, pick({"Oi! Empty your pockets!", "Cash. Now. Don't make this messy.", "Hand it over, mate."}), 3)
-	notify(ctx.player, "A mugger wants your cash! Fight him, or run!")
-
-	local gaveUp = false
-	local waitStart = os.clock()
-	while os.clock() - waitStart < 9 and ctx:alive() do
-		if hum.Health <= 0 then break end
-		face(thug, ctx:pos())
-		local p = ctx:pos()
-		if p and (p - root.Position).Magnitude > 22 then gaveUp = true break end
-		ctx:wait(0.3)
-	end
-	if hum.Health <= 0 or not thug.Parent then
-		notify(ctx.player, "You put the mugger down.")
-		return true
-	end
-	if gaveUp then
-		anim(thug, nil)
-		say(thug, "Forget it. Not worth the hassle.", 3)
-		return true
-	end
-
-	anim(thug, "NPCSwing")
-	ctx:wait(0.3)
-	local stolen = math.min(cash.Value, math.max(5, math.floor(cash.Value * 0.15)))
-	cash.Value -= stolen
-	notify(ctx.player, "The mugger took $" .. stolen .. " and ran. Catch him to get it back!")
-	say(thug, "Cheers for the donation!", 3)
-	local player = ctx.player
-	hum.Died:Once(function()
-		if player.Parent then
-			local c = player:FindFirstChild("Cash")
-			if c then c.Value += stolen end
-			notify(player, "You got your $" .. stolen .. " back.")
-		end
-	end)
-	flee(thug, ctx:pos() or root.Position, 160, 22)
-	ctx:wait(30)
-	return true
-end}
-
-local CRASH_LINES = {"WHERE DID YOU LEARN TO DRIVE?!", "You came out of nowhere!", "Look at my car!", "I had right of way!", "My insurance is going to love this.", "Are you blind?!"}
-local function pathLength(points)
-	local length = 0
-	for i = 2, #points do length += flat(points[i] - points[i - 1]).Magnitude end
-	return length
-end
-events.CarCrash = {weight = 1.5, run = function(ctx)
-	if not (Vehicles and RoadNetwork) then return false end
-	local here = ctx:pos()
-	local route
-	for _ = 1, 8 do
-		local node = RoadNetwork.nodeBetween(here, 80, 170)
-		if node then
-			local nbs = RoadNetwork.neighbours(node)
-			if #nbs >= 2 then
-				local i = math.random(#nbs)
-				local j = (i % #nbs) + 1
-				local function build(from)
-					local pts = RoadNetwork.pointsFor({from, node})
-					if #pts < 2 then return nil end
-					local dir = flat(pts[#pts] - pts[#pts - 1])
-					if dir.Magnitude < 0.1 then return nil end
-					table.insert(pts, pts[#pts] + dir.Unit * 45)
-					return pts
-				end
-				local a, b = build(nbs[i]), build(nbs[j])
-				if a and b and not (Visibility and (Visibility.seen(a[1]) or Visibility.seen(b[1]))) then
-					route = {a = a, b = b, center = RoadNetwork.nodePosition(node)}
-					break
-				end
-			end
-		end
-	end
-	if not route then return false end
-
-	local okA, carA = pcall(Vehicles.new, "Civilian", Vehicles.startCFrame(route.a))
-	local okB, carB = pcall(Vehicles.new, "Civilian", Vehicles.startCFrame(route.b))
-	if not okA or not okB then
-		if okA then pcall(function() carA:destroy() end) end
-		if okB then pcall(function() carB:destroy() end) end
-		return false
-	end
-	ctx:track(carA)
-	ctx:track(carB)
-	pcall(function() carA:seatNpcDriver() end)
-	pcall(function() carB:seatNpcDriver() end)
-
-	local speed = 40
-	local lenA, lenB = pathLength(route.a), pathLength(route.b)
-	local function launch(car, points, delay)
-		if delay <= 0.05 then
-			car:drive(points, speed)
-		else
-			task.delay(delay, function()
-				if car.body and car.body.Parent then car:drive(points, speed) end
-			end)
-		end
-	end
-	launch(carA, route.a, (lenB - lenA) / speed)
-	launch(carB, route.b, (lenA - lenB) / speed)
-
-	ctx:hint(route.center, 190, "Tyres screech somewhere ahead.")
-	local started = os.clock()
-	local crashed = false
-	while os.clock() - started < math.max(lenA, lenB) / speed + 8 and ctx:alive() do
-		if carA.body and carB.body and carA.body.Parent and carB.body.Parent then
-			local pa, pb = carA.body.Position, carB.body.Position
-			if (pa - pb).Magnitude < 11 or (flat(pa - route.center).Magnitude < 7 and flat(pb - route.center).Magnitude < 22) or (flat(pb - route.center).Magnitude < 7 and flat(pa - route.center).Magnitude < 22) then
-				crashed = true
-				break
-			end
-		end
-		task.wait(0.1)
-	end
-	if not crashed then return true end
-
-	local mid = (carA.body.Position + carB.body.Position) / 2
-	for _, car in ipairs({carA, carB}) do
-		pcall(function() car:dent(mid, 1.4) end)
-		pcall(function() car:breakGlass(mid, 1.2) end)
-		pcall(function() car:damage(55) end)
-		pcall(function() car:coastToStop() end)
-	end
-	if Alert then Alert.makeNoise(mid, 90) end
-	ctx:wait(1.2)
-
-	local drivers = {}
-	for _, car in ipairs({carA, carB}) do
-		local ok, rig = pcall(function() return car:ejectNpcDriver() end)
-		if ok and rig then
-			rig:SetAttribute("BenchBusy", true)
-			rig:SetAttribute("EventNPC", true)
-			ctx:track(rig)
-			table.insert(drivers, rig)
-		end
-	end
-	ctx:wait(1)
-	local talkUntil = os.clock() + 22
-	while os.clock() < talkUntil and ctx:alive() do
-		for n, rig in ipairs(drivers) do
-			if rig.Parent then
-				local other = drivers[(n % #drivers) + 1]
-				if other and other.Parent and other ~= rig then face(rig, other:GetPivot().Position) end
-				anim(rig, "Argue")
-				say(rig, pick(CRASH_LINES), 3)
-			end
-		end
-		ctx:wait(3.5)
-	end
-	for _, rig in ipairs(drivers) do anim(rig, nil) end
-	ctx:wait(25)
-	return true
-end}
-
-local PARTY_LINES = {"WOOOO!", "Turn it up!", "Best night EVER!", "Who's got the drinks?!", "This is my song!", "Cheers, mate!", "Get in!"}
-events.Party = {weight = 1.5, run = function(ctx)
-	local blocks = workspace:FindFirstChild("City Map") and workspace["City Map"]:FindFirstChild("Blocks")
-	if not blocks then return false end
-	local here = ctx:pos()
-	local houses = {}
-	for _, h in ipairs(blocks:GetChildren()) do
-		if h:IsA("Model") and h:GetAttribute("Housing") and not tostring(h:GetAttribute("Housing")):find("Pub") and not h:GetAttribute("ShopKind") then
-			local p = h:GetPivot().Position
-			local d = flat(p - here).Magnitude
-			if d > 90 and d < 230 and not (Visibility and Visibility.seen(p)) then table.insert(houses, h) end
-		end
-	end
-	if #houses == 0 then return false end
-	local house = pick(houses)
-	local centre = house:GetPivot().Position
-
-	local speaker = Instance.new("Part")
-	speaker.Name = "PartySpeaker"
-	speaker.Anchored = true
-	speaker.CanCollide = false
-	speaker.CanQuery = false
-	speaker.CanTouch = false
-	speaker.Transparency = 1
-	speaker.Size = Vector3.new(1, 1, 1)
-	speaker.Position = centre + Vector3.new(0, 6, 0)
-	speaker.Parent = workspace
-	ctx:track(speaker)
-	local music = Instance.new("Sound")
-	music.SoundId = "rbxassetid://" .. tostring(PARTY_SOUND)
-	music.Looped = true
-	music.Volume = 3
-	music.RollOffMode = Enum.RollOffMode.Linear
-	music.RollOffMinDistance = 35
-	music.RollOffMaxDistance = 240
-	music.Parent = speaker
-	music:Play()
-
-	local lights = {}
-	for i = 1, 2 do
-		local l = Instance.new("PointLight")
-		l.Range = 48
-		l.Brightness = 4
-		l.Shadows = false
-		l.Parent = speaker
-		lights[i] = l
-	end
-	local colours = {Color3.fromRGB(255, 40, 160), Color3.fromRGB(40, 220, 255), Color3.fromRGB(255, 220, 40), Color3.fromRGB(140, 60, 255)}
-
-	local guests = {}
-	for i = 1, 9 do
-		local angle = (i / 9) * math.pi * 2 + math.random() * 0.4
-		local radius = 20 + math.random() * 7
-		local at = groundPoint(centre + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius))
-		local npc = spawnNpc(i % 4 == 0 and "Regular" or "Drunk", at, centre)
-		if npc then
-			ctx:track(npc)
-			table.insert(guests, npc)
-			anim(npc, pick({"Dance", "Dance", "Cheer"}))
-		end
-	end
-
-	local told = false
-	local started = os.clock()
-	local awayFor = 0
-	local step = 0
-	while os.clock() - started < 170 and ctx:alive() do
-		step += 1
-		lights[1].Color = colours[(step % #colours) + 1]
-		lights[2].Color = colours[((step + 2) % #colours) + 1]
-		if not told and ctx:near(centre, 170) then
-			told = true
-			notify(ctx.player, "You can hear a party going on nearby.")
-		end
-		if step % 12 == 0 then
-			for _, g in ipairs(guests) do
-				if g.Parent then
-					anim(g, pick({"Dance", "Dance", "Cheer"}))
-					if math.random() < 0.25 then say(g, pick(PARTY_LINES), 2.5) end
-				end
-			end
-		end
-		if ctx:near(centre, 330) then awayFor = 0 else awayFor += 0.4 if awayFor > 25 then break end end
-		task.wait(0.4)
-	end
-	TweenService:Create(music, TweenInfo.new(2), {Volume = 0}):Play()
-	for _, g in ipairs(guests) do anim(g, nil) end
-	ctx:wait(2.5)
-	return true
-end}
-
-local CONVOS = {
-	{"Did you see the match last night?", "Don't even start. We were robbed.", "Ref was blind, mate.", "Pint later?", "Go on then."},
-	{"Landlord's put the rent up again.", "Again?! That's the third time.", "I'll be sleeping in the car soon.", "Come round mine. Bring snacks.", "Deal."},
-	{"Heard someone nicked a police car?", "No way. Who'd be that daft?", "Some hobo, apparently.", "Respect, honestly.", "Shh, keep your voice down."},
-	{"This weather's doing my head in.", "It's always like this, mate.", "I miss summer.", "We don't get summer, we get a damp August.", "Ha! True."},
-	{"You hear the sirens last night?", "Couldn't miss them.", "Place is going downhill.", "It was always downhill, love.", "Fair point."},
-}
-events.Convo = {weight = 3, run = function(ctx)
-	local spot = sidewalkSpot(ctx:pos(), 25, 90)
-	if not spot then return false end
-	local a = spawnNpc("Regular", spot + Vector3.new(-1.4, 0, 0))
-	local b = spawnNpc(pick({"Drunk", "Regular", "Coward"}), spot + Vector3.new(1.4, 0, 0))
-	if not a or not b then return false end
-	ctx:track(a)
-	ctx:track(b)
-	local lines = pick(CONVOS)
-	for i, line in ipairs(lines) do
-		local speaker, listener = a, b
-		if i % 2 == 0 then speaker, listener = b, a end
-		if not (speaker.Parent and listener.Parent) then break end
-		face(speaker, listener:GetPivot().Position)
-		face(listener, speaker:GetPivot().Position)
-		anim(listener, nil)
-		anim(speaker, "Argue")
-		say(speaker, line, 3.2)
-		if not ctx:wait(3.6) then break end
-	end
-	anim(a, nil)
-	anim(b, nil)
-	return true
-end}
-
-events.Fire = {weight = 1.5, run = function(ctx)
-	local ignite = ServerScriptService:FindFirstChild("IgniteTarget")
-	if not ignite then return false end
-	local here = ctx:pos()
-	local options = {}
-	for _, thing in ipairs(CollectionService:GetTagged("Flammable")) do
-		if thing.Parent and not thing:GetAttribute("Burning") and not thing:GetAttribute("Charred") then
-			local part = thing:IsA("BasePart") and thing or thing:FindFirstChildWhichIsA("BasePart", true)
-			if part then
-				local d = flat(part.Position - here).Magnitude
-				if d > 55 and d < 170 and not (Visibility and Visibility.seen(part.Position)) then table.insert(options, thing) end
-			end
-		end
-	end
-	if #options == 0 then return false end
-	local target = pick(options)
-	local part = target:IsA("BasePart") and target or target:FindFirstChildWhichIsA("BasePart", true)
-	ignite:Fire(target)
-	if Alert then Alert.makeNoise(part.Position, 45, "flee") end
-	ctx:hint(part.Position, 190, "You smell smoke. Something is on fire nearby.")
-	ctx:wait(40)
-	return true
-end}
-
-local function recogniseMood(player)
-	local standing = player:GetAttribute("RepStanding") or 0
-	local fame = player:GetAttribute("RepFame") or 0
-	local title = player:GetAttribute("RepTitle") or "Nobody"
-	local heat = Heat and Heat.getLevel and Heat.getLevel(player) or 0
-	if heat >= 1 then return "wanted", title end
-	if standing >= 35 then return "fan", title end
-	if standing <= -35 then return "afraid", title end
-	if fame >= 300 and title ~= "Nobody" then return "known", title end
-	return nil, title
-end
-events.Recognised = {weight = 2.5, run = function(ctx)
-	local mood, title = recogniseMood(ctx.player)
-	if not mood then return false end
-	local playerPos = ctx:pos()
-	local spot = sidewalkSpot(playerPos, 35, 80)
-	if not spot then return false end
-	local npc = spawnNpc(pick({"Regular", "Drunk", "Coward"}), spot, playerPos)
-	if not npc then return false end
-	ctx:track(npc)
-	local hum, root = humOf(npc), hrpOf(npc)
-	if not hum or not root then return false end
-	hum.WalkSpeed = 13
-
-	local arrived = false
-	local started = os.clock()
-	while os.clock() - started < 30 and ctx:alive() and npc.Parent do
-		local p = ctx:pos()
-		if not p then break end
-		if (p - root.Position).Magnitude < 7 then arrived = true break end
-		hum:MoveTo(p)
-		ctx:wait(0.4)
-	end
-	if not arrived then return true end
-	hum:MoveTo(root.Position)
-	face(npc, ctx:pos())
-
-	if mood == "wanted" then
-		anim(npc, "Shout")
-		say(npc, "Hang on... you're the one the police are after!", 3.5)
-		ctx:wait(2.2)
-		anim(npc, nil)
-		say(npc, "HELP! POLICE! He's over here!", 3)
-		if Alert then Alert.crime(ctx.player, 1, playerPos) end
-		flee(npc, ctx:pos() or root.Position, 120, 22)
-	elseif mood == "fan" then
-		anim(npc, "Cheer")
-		say(npc, "It's you! The " .. title .. "! You're a legend round here!", 4)
-		ctx:wait(2.8)
-		anim(npc, nil)
-		local reward = math.random(5, 25)
-		local cash = ctx.player:FindFirstChild("Cash")
-		if cash then cash.Value += reward end
-		say(npc, "Here, get yourself something to eat.", 3)
-		notify(ctx.player, "A fan recognised you and slipped you $" .. reward)
-	elseif mood == "afraid" then
-		anim(npc, "HandsUp")
-		say(npc, "Oh no... it's the " .. title .. ". Please, stay away from me!", 3.5)
-		ctx:wait(2.5)
-		anim(npc, nil)
-		flee(npc, ctx:pos() or root.Position, 120, 20)
-	else
-		anim(npc, "Argue")
-		say(npc, "Oi, you're that " .. title .. ", aren't you?", 3.5)
-		ctx:wait(3)
-		say(npc, "Respect.", 2)
-		ctx:wait(2)
-		anim(npc, nil)
-	end
-	ctx:wait(6)
-	return true
-end}
-
-local busy = {}
-local nextAt = {}
-local active = 0
-
-local function runEvent(player, name, forced)
-	local event = events[name]
-	if not event or busy[player] then return end
-	local ctx = makeContext(player)
-	busy[player] = true
-	active += 1
-	task.spawn(function()
-		local ok, result = pcall(event.run, ctx)
-		if not ok then warn("[RandomEvents] " .. name .. ": " .. tostring(result)) end
-		ctx:finish()
-		busy[player] = nil
-		active -= 1
-		if ok and result == false and not forced then nextAt[player] = os.clock() + 12 end
-		if forced then print("[RandomEvents] " .. name .. " finished (" .. tostring(ok and result) .. ")") end
-	end)
-end
-
-local function chooseEvent(player)
-	local total = 0
-	local list = {}
-	for name, event in pairs(events) do
-		local usable = true
-		if name == "CarCrash" and not (Vehicles and RoadNetwork) then usable = false end
-		if usable then
-			total += event.weight
-			table.insert(list, {name, event.weight})
-		end
-	end
-	local r = math.random() * total
-	for _, entry in ipairs(list) do
-		r -= entry[2]
-		if r <= 0 then return entry[1] end
-	end
-	return list[1] and list[1][1]
-end
-
-local function eligible(player)
-	if busy[player] or not rootOf(player) then return false end
-	if player:GetAttribute("Cuffed") or player:GetAttribute("Sleeping") or player:GetAttribute("Driving") then return false end
-	if Heat and Heat.getLevel and Heat.getLevel(player) >= 4 then return false end
-	return true
-end
-
 task.spawn(function()
+	for _, d in ipairs(workspace:GetDescendants()) do -- one-off full scan, off the main thread
+		noteHouse(d)
+	end
+end)
+workspace.DescendantAdded:Connect(function(d: Instance)
+	if d:IsA("Model") then task.defer(noteHouse, d) end -- defer: attributes may be set just after parenting
+end)
+
+function Life.manager()
+	task.wait(3)
 	while true do
-		task.wait(5)
-		if active < MAX_ACTIVE then
-			for _, player in ipairs(Players:GetPlayers()) do
-				if eligible(player) then
-					if not nextAt[player] then nextAt[player] = os.clock() + FIRST_EVENT_DELAY end
-					if os.clock() >= nextAt[player] then
-						nextAt[player] = os.clock() + math.random(MIN_GAP, MAX_GAP)
-						local name = chooseEvent(player)
-						if name then runEvent(player, name, false) end
+		task.wait(1.2)
+		local spawnBudget = 2 -- homes populated per pass: a whole street appearing at once made the server stall
+		local count = 0
+		for _ in pairs(residents) do count += 1 end
+		-- iterate BACKWARDS so table.remove does not skip entries
+		for index = #houseList, 1, -1 do
+			local house: Model? = houseList[index]
+			if house and not house.Parent then
+				houseSet[house] = nil
+				table.remove(houseList, index)
+				house = nil
+			end
+			-- a house stripped of its furniture (nobody near) sends its residents away too
+			if house and homes[house] and not house:FindFirstChild("Furniture") then
+				for _, npcs in pairs(homes[house]) do
+					for _, npc in ipairs(npcs) do
+						if npc.Parent then npc:Destroy() end
 					end
-				else
-					nextAt[player] = nil
 				end
+				homes[house] = nil
 			end
-		end
-	end
-end)
-
-workspace:GetAttributeChangedSignal("ForceEvent"):Connect(function()
-	local name = workspace:GetAttribute("ForceEvent")
-	if not name or name == "" then return end
-	workspace:SetAttribute("ForceEvent", nil)
-	local player = Players:GetPlayers()[1]
-	if player and events[name] then
-		print("[RandomEvents] forcing " .. name)
-		busy[player] = nil
-		runEvent(player, name, true)
-	else
-		warn("[RandomEvents] unknown event or no player: " .. tostring(name))
-	end
-end)
-
-task.spawn(function()
-	while true do
-		task.wait(20)
-		for npc, since in pairs(leftovers) do
-			if not npc.Parent then
-				leftovers[npc] = nil
-			else
-				local root = hrpOf(npc)
-				local nearest = math.huge
-				for _, p in ipairs(Players:GetPlayers()) do
-					local r = rootOf(p)
-					if r and root then nearest = math.min(nearest, (r.Position - root.Position).Magnitude) end
+			if house and house:FindFirstChild("Furniture") and #(house :: Model).Furniture:GetChildren() > 0
+				and not house:GetAttribute("Vacant") and not house:GetAttribute("HideoutOwner") then
+				local dist = nearestPlayerDistance(house:GetPivot().Position)
+				local entry = homes[house]
+				if not entry then
+					entry = {}
+					homes[house] = entry
 				end
-				if os.clock() - since > 240 or nearest > 260 then
-					if not (Visibility and root and Visibility.seen(root.Position)) then
-						leftovers[npc] = nil
-						npc:Destroy()
+				for unit = 1, (house:GetAttribute("Units") :: number?) or 1 do
+					local npcs = entry[unit]
+					if dist < SPAWN_RANGE and not npcs and spawnBudget > 0 and count < MAX_RESIDENTS and zoneFor(house, unit) then
+						spawnBudget -= 1
+						npcs = {}
+						entry[unit] = npcs
+						for i = 1, countFor(house) do
+							-- first one is the owner (bartender in a pub); the rest are guests; pub guests 4+ go upstairs
+							local role: ResidentRole = if i == 1 then (if house.Name:find("Pub") then "bartender" else "landlord") else "guest"
+							local npc = Life.spawn(house, unit, role, house.Name:find("Pub") ~= nil and i >= 4)
+							if npc then
+								npcs[#npcs + 1] = npc
+								count += 1
+							end
+						end
+					elseif dist > DESPAWN_RANGE and npcs then
+						for _, npc in ipairs(npcs) do
+							if npc.Parent then npc:Destroy() end
+						end
+						entry[unit] = nil
 					end
 				end
 			end
 		end
 	end
-end)
+end
 
-print("[RandomEvents] ready")
+Life.residents = residents
+return Life
